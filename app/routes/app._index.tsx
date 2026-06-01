@@ -63,18 +63,31 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   );
 
   // Saved matches we're actually tracking (rejected decisions stay in the DB
-  // for audit but aren't shown here). Each carries its newest reading + a count.
+  // for audit but aren't shown here). Pull the two newest readings per match so
+  // we can show the price movement since last check, plus a total count.
   const trackedRaw = await prisma.match.findMany({
     where: { shop, status: { not: "rejected" } },
     orderBy: { updatedAt: "desc" },
     include: {
-      observations: { orderBy: { scrapedAt: "desc" }, take: 1 },
+      observations: { orderBy: { scrapedAt: "desc" }, take: 2 },
       _count: { select: { observations: true } },
     },
   });
 
   const tracked = trackedRaw.map((m) => {
     const latest = m.observations[0] ?? null;
+    const previous = m.observations[1] ?? null;
+
+    // Price delta vs the immediately previous reading (rounded to cents to
+    // avoid float noise). Null when either side lacks a price.
+    let priceDelta: number | null = null;
+    if (latest?.price != null && previous?.price != null) {
+      priceDelta = Math.round((latest.price - previous.price) * 100) / 100;
+    }
+    // The silent-failure signal: we used to read a price here, now we don't.
+    const priceDisappeared =
+      latest != null && latest.price == null && previous?.price != null;
+
     return {
       id: m.id,
       productGid: m.productGid,
@@ -88,6 +101,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       lastInStock: latest?.inStock ?? null,
       lastScrapedAt: latest ? latest.scrapedAt.toISOString() : null,
       observationCount: m._count.observations,
+      prevPrice: previous?.price ?? null,
+      priceDelta,
+      priceDisappeared,
     };
   });
 
@@ -346,6 +362,32 @@ export default function Index() {
                           ? " - out of stock"
                           : ""}
                     </s-text>
+
+                    {/* Price movement since the previous reading */}
+                    {t.observationCount < 2 ? (
+                      <s-text>First reading - no comparison yet.</s-text>
+                    ) : t.priceDisappeared ? (
+                      <s-text>
+                        Warning: no price found this check (last was{" "}
+                        {t.lastCurrency ?? ""} {t.prevPrice}) - the page or
+                        scraper may have changed.
+                      </s-text>
+                    ) : t.priceDelta == null ? (
+                      <s-text>Price comparison unavailable.</s-text>
+                    ) : t.priceDelta === 0 ? (
+                      <s-text>Price unchanged since last check.</s-text>
+                    ) : t.priceDelta > 0 ? (
+                      <s-text>
+                        Price up {t.lastCurrency ?? ""} {Math.abs(t.priceDelta)}{" "}
+                        since last check.
+                      </s-text>
+                    ) : (
+                      <s-text>
+                        Price down {t.lastCurrency ?? ""} {Math.abs(t.priceDelta)}{" "}
+                        since last check.
+                      </s-text>
+                    )}
+
                     <s-text>
                       {t.observationCount} reading{t.observationCount === 1 ? "" : "s"}
                       {t.lastScrapedAt
