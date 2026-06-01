@@ -115,6 +115,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shop = session.shop;
 
   const form = await request.formData();
+  const intent = String(form.get("intent") || "match");
+
+  // --- Status update (confirm / reject) — patches the Match, no re-scrape.
+  if (intent === "setStatus") {
+    const matchId = String(form.get("matchId") || "");
+    const status = String(form.get("status") || "");
+    const allowed = ["confirmed", "rejected", "needs_review", "auto"];
+    if (matchId && allowed.includes(status)) {
+      // updateMany + shop scope: can't touch another shop's row, won't throw
+      // on a stale id.
+      await prisma.match.updateMany({
+        where: { id: matchId, shop },
+        data: { status },
+      });
+    }
+    return { result: null, error: null, saved: false };
+  }
+
+  // --- Default: match a competitor URL against a merchant product.
   const competitorUrl = String(form.get("competitorUrl") || "").trim();
   let merchant: Record<string, unknown> = {};
   try {
@@ -251,6 +270,14 @@ export default function Index() {
     const product = products.find((p) => p.id === t.productGid);
     if (!product) return;
     runCheck(JSON.stringify(product), t.competitorUrl);
+  };
+
+  const setStatus = (matchId: string, status: string) => {
+    const fd = new FormData();
+    fd.set("intent", "setStatus");
+    fd.set("matchId", matchId);
+    fd.set("status", status);
+    fetcher.submit(fd, { method: "POST" });
   };
 
   return (
@@ -394,17 +421,36 @@ export default function Index() {
                         ? ` - last checked ${new Date(t.lastScrapedAt).toLocaleString()}`
                         : ""}
                     </s-text>
-                    {inCatalog ? (
-                      <s-stack direction="inline" gap="base">
+
+                    <s-stack direction="inline" gap="base">
+                      {inCatalog && (
                         <s-button
                           onClick={() => recheck(t)}
                           {...(busy ? { loading: true } : {})}
                         >
                           Re-check now
                         </s-button>
-                      </s-stack>
-                    ) : (
-                      <s-text>Product not in current catalog - can&apos;t re-check.</s-text>
+                      )}
+                      {t.status === "needs_review" && (
+                        <s-button
+                          onClick={() => setStatus(t.id, "confirmed")}
+                          {...(busy ? { loading: true } : {})}
+                        >
+                          Confirm match
+                        </s-button>
+                      )}
+                      <s-button
+                        onClick={() => setStatus(t.id, "rejected")}
+                        {...(busy ? { loading: true } : {})}
+                      >
+                        Not a match
+                      </s-button>
+                    </s-stack>
+
+                    {!inCatalog && (
+                      <s-text>
+                        Product not in current catalog - can&apos;t re-check.
+                      </s-text>
                     )}
                   </s-stack>
                 </s-box>
