@@ -7,6 +7,7 @@ import type {
 import { useFetcher, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
+import prisma from "../db.server";
 
 // The local Python engine service (serve.py). Server-side call only.
 const ENGINE_URL = "http://127.0.0.1:8787";
@@ -21,7 +22,8 @@ type CatalogProduct = {
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
 
   const response = await admin.graphql(
     `#graphql
@@ -60,11 +62,41 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     },
   );
 
-  return { currency: data?.shop?.currencyCode ?? "", products };
+  // Saved matches we're actually tracking (rejected decisions stay in the DB
+  // for audit but aren't shown here). Each carries its newest reading + a count.
+  const trackedRaw = await prisma.match.findMany({
+    where: { shop, status: { not: "rejected" } },
+    orderBy: { updatedAt: "desc" },
+    include: {
+      observations: { orderBy: { scrapedAt: "desc" }, take: 1 },
+      _count: { select: { observations: true } },
+    },
+  });
+
+  const tracked = trackedRaw.map((m) => {
+    const latest = m.observations[0] ?? null;
+    return {
+      id: m.id,
+      productGid: m.productGid,
+      productTitle: m.productTitle,
+      competitorUrl: m.competitorUrl,
+      competitorHost: m.competitorHost,
+      status: m.status,
+      confidence: m.confidence,
+      lastPrice: latest?.price ?? null,
+      lastCurrency: latest?.currency ?? null,
+      lastInStock: latest?.inStock ?? null,
+      lastScrapedAt: latest ? latest.scrapedAt.toISOString() : null,
+      observationCount: m._count.observations,
+    };
+  });
+
+  return { currency: data?.shop?.currencyCode ?? "", products, tracked };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  await authenticate.admin(request); // ensure the request is authenticated
+  const { session } = await authenticate.admin(request);
+  const shop = session.shop;
 
   const form = await request.formData();
   const competitorUrl = String(form.get("competitorUrl") || "").trim();
@@ -76,9 +108,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (!competitorUrl) {
-    return { result: null, error: "Enter a competitor product URL." };
+    return { result: null, error: "Enter a competitor product URL.", saved: false };
   }
 
+  // 1) Ask the engine for a match decision.
+  let result: any = null;
   try {
     const res = await fetch(`${ENGINE_URL}/match`, {
       method: "POST",
@@ -89,14 +123,79 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }),
     });
     const data = (await res.json()) as any;
-    if (data.error) return { result: null, error: data.error };
-    return { result: data.results?.[0] ?? null, error: null };
+    if (data.error) return { result: null, error: data.error, saved: false };
+    result = data.results?.[0] ?? null;
   } catch (e: any) {
     return {
       result: null,
       error: `Could not reach the engine service at ${ENGINE_URL}. Is "python serve.py" running? (${e?.message ?? e})`,
+      saved: false,
     };
   }
+
+  if (!result) {
+    return { result: null, error: "The engine returned no result for that URL.", saved: false };
+  }
+
+  // 2) Persist the decision (a Match) and, if we're tracking it, a price reading
+  //    (an Observation). A DB failure here must not hide a good match from the
+  //    merchant, so this is isolated and the result is returned either way.
+  let saved = false;
+  try {
+    const productGid = String((merchant as any).id ?? "");
+    const productTitle = String((merchant as any).title ?? "(untitled)");
+    let competitorHost: string | null = null;
+    try {
+      competitorHost = new URL(competitorUrl).host;
+    } catch {
+      competitorHost = null;
+    }
+
+    if (productGid) {
+      const match = await prisma.match.upsert({
+        where: {
+          shop_productGid_competitorUrl: { shop, productGid, competitorUrl },
+        },
+        update: {
+          productTitle,
+          competitorHost,
+          confidence: Number(result.confidence ?? 0),
+          method: String(result.method ?? ""),
+          status: String(result.status ?? "auto"),
+        },
+        create: {
+          shop,
+          productGid,
+          productTitle,
+          competitorUrl,
+          competitorHost,
+          confidence: Number(result.confidence ?? 0),
+          method: String(result.method ?? ""),
+          status: String(result.status ?? "auto"),
+        },
+      });
+
+      // Record a reading for any tracked (non-rejected) source — including a
+      // null price, which is the signal silent-failure detection looks for.
+      if (result.status !== "rejected") {
+        await prisma.observation.create({
+          data: {
+            matchId: match.id,
+            price: result.price != null ? Number(result.price) : null,
+            currency: result.currency ?? null,
+            inStock: typeof result.in_stock === "boolean" ? result.in_stock : null,
+            via: result.extracted_via ?? null,
+          },
+        });
+      }
+      saved = true;
+    }
+  } catch (e) {
+    console.error("Persist failed:", e);
+    saved = false;
+  }
+
+  return { result, error: null, saved };
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -107,7 +206,7 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export default function Index() {
-  const { currency, products } = useLoaderData<typeof loader>();
+  const { currency, products, tracked } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const [selected, setSelected] = useState(0);
   const [url, setUrl] = useState("");
@@ -116,13 +215,26 @@ export default function Index() {
   const data = fetcher.data;
   const r = data?.result;
 
+  // Submit helper — builds explicit FormData so the fields can never be dropped
+  // by object-shorthand serialization. Refuses to submit an empty URL.
+  const runCheck = (productJson: string, competitorUrl: string) => {
+    if (!competitorUrl.trim()) return;
+    const fd = new FormData();
+    fd.set("product", productJson);
+    fd.set("competitorUrl", competitorUrl);
+    fetcher.submit(fd, { method: "POST" });
+  };
+
   const check = () => {
     const product = products[selected];
     if (!product) return;
-    fetcher.submit(
-      { product: JSON.stringify(product), competitorUrl: url },
-      { method: "POST" },
-    );
+    runCheck(JSON.stringify(product), url);
+  };
+
+  const recheck = (t: (typeof tracked)[number]) => {
+    const product = products.find((p) => p.id === t.productGid);
+    if (!product) return;
+    runCheck(JSON.stringify(product), t.competitorUrl);
   };
 
   return (
@@ -194,8 +306,69 @@ export default function Index() {
               {Array.isArray(r.reasons) && r.reasons.length > 0 && (
                 <s-text>Why: {r.reasons.join("; ")}</s-text>
               )}
+              {data?.saved && r.status !== "rejected" && (
+                <s-text>Saved - now tracking this competitor&apos;s price.</s-text>
+              )}
+              {data?.saved && r.status === "rejected" && (
+                <s-text>Saved this decision (not tracked).</s-text>
+              )}
             </s-stack>
           </s-section>
+        )}
+      </s-section>
+
+      <s-section heading={`Tracked competitors (${tracked.length})`}>
+        {tracked.length === 0 ? (
+          <s-paragraph>
+            No saved competitors yet. Check one above to start tracking it.
+          </s-paragraph>
+        ) : (
+          <s-stack direction="block" gap="base">
+            {tracked.map((t) => {
+              const inCatalog = products.some((p) => p.id === t.productGid);
+              return (
+                <s-box key={t.id} padding="base" borderWidth="base" borderRadius="base">
+                  <s-stack direction="block" gap="base">
+                    <s-heading>{t.productTitle}</s-heading>
+                    <s-text>
+                      {STATUS_LABEL[t.status] ?? t.status} -{" "}
+                      {Math.round((t.confidence ?? 0) * 100)}% confidence
+                    </s-text>
+                    <s-text>Competitor: {t.competitorHost ?? t.competitorUrl}</s-text>
+                    <s-text>
+                      Last reading:{" "}
+                      {t.lastPrice != null
+                        ? `${t.lastCurrency ?? ""} ${t.lastPrice}`
+                        : "no price"}
+                      {t.lastInStock === true
+                        ? " - in stock"
+                        : t.lastInStock === false
+                          ? " - out of stock"
+                          : ""}
+                    </s-text>
+                    <s-text>
+                      {t.observationCount} reading{t.observationCount === 1 ? "" : "s"}
+                      {t.lastScrapedAt
+                        ? ` - last checked ${new Date(t.lastScrapedAt).toLocaleString()}`
+                        : ""}
+                    </s-text>
+                    {inCatalog ? (
+                      <s-stack direction="inline" gap="base">
+                        <s-button
+                          onClick={() => recheck(t)}
+                          {...(busy ? { loading: true } : {})}
+                        >
+                          Re-check now
+                        </s-button>
+                      </s-stack>
+                    ) : (
+                      <s-text>Product not in current catalog - can&apos;t re-check.</s-text>
+                    )}
+                  </s-stack>
+                </s-box>
+              );
+            })}
+          </s-stack>
         )}
       </s-section>
 
