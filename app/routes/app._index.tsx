@@ -8,9 +8,16 @@ import { useFetcher, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
+import { recheckMatch, discoverCompetitors } from "../lib/recheck.server";
+import { getPlanInfo, UNLIMITED } from "../lib/billing.server";
 
-// The local Python engine service (serve.py). Server-side call only.
-const ENGINE_URL = "http://127.0.0.1:8787";
+// App handle for building the managed-pricing plan-selection URL. This is the
+// slug Shopify assigns the app (Partner Dashboard -> your app -> the URL slug),
+// NOT necessarily the display name. The plan page lives at
+//   https://admin.shopify.com/store/<storeHandle>/charges/<APP_HANDLE>/pricing_plans
+// A wrong handle 404s on the upgrade click, so confirm it in the dashboard.
+// >>> FILL THIS IN <<<
+const APP_HANDLE = "price-engine";
 
 type CatalogProduct = {
   id: string;
@@ -22,7 +29,7 @@ type CatalogProduct = {
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, session, billing } = await authenticate.admin(request);
   const shop = session.shop;
 
   const response = await admin.graphql(
@@ -63,20 +70,22 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   );
 
   // Saved matches we're actually tracking (rejected decisions stay in the DB
-  // for audit but aren't shown here). Pull the two newest readings per match so
-  // we can show the price movement since last check, plus a total count.
+  // for audit but aren't shown here). Pull a short window of recent readings
+  // per match: enough to show price movement AND to spot a broken-scraper
+  // streak (consecutive no-price reads), plus a total count.
   const trackedRaw = await prisma.match.findMany({
     where: { shop, status: { not: "rejected" } },
     orderBy: { updatedAt: "desc" },
     include: {
-      observations: { orderBy: { scrapedAt: "desc" }, take: 2 },
+      observations: { orderBy: { scrapedAt: "desc" }, take: 6 },
       _count: { select: { observations: true } },
     },
   });
 
   const tracked = trackedRaw.map((m) => {
-    const latest = m.observations[0] ?? null;
-    const previous = m.observations[1] ?? null;
+    const obs = m.observations; // newest first
+    const latest = obs[0] ?? null;
+    const previous = obs[1] ?? null;
 
     // Price delta vs the immediately previous reading (rounded to cents to
     // avoid float noise). Null when either side lacks a price.
@@ -87,6 +96,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     // The silent-failure signal: we used to read a price here, now we don't.
     const priceDisappeared =
       latest != null && latest.price == null && previous?.price != null;
+
+    // Broken-scraper signal: how many of the most-recent reads in a row had no
+    // price. 1 is a blip; >=2 is a sustained failure worth acting on. Counted
+    // only across the pulled window, so it floors at that window size.
+    let consecutiveNulls = 0;
+    for (const o of obs) {
+      if (o.price == null) consecutiveNulls++;
+      else break;
+    }
+    // Most recent reading that DID have a price, for the "last known" message.
+    const lastKnown = obs.find((o) => o.price != null) ?? null;
 
     return {
       id: m.id,
@@ -104,20 +124,60 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       prevPrice: previous?.price ?? null,
       priceDelta,
       priceDisappeared,
+      consecutiveNulls,
+      lastKnownPrice: lastKnown?.price ?? null,
+      lastKnownCurrency: lastKnown?.currency ?? null,
     };
   });
 
-  return { currency: data?.shop?.currencyCode ?? "", products, tracked };
+  // Recent alerts (newest first). Dismissed ones are kept (readAt set) and
+  // shown greyed, for audit and so a later email job still sees history.
+  const alertRows = await prisma.alert.findMany({
+    where: { shop },
+    orderBy: { createdAt: "desc" },
+    take: 20,
+  });
+  const alerts = alertRows.map((al) => ({
+    id: al.id,
+    type: al.type,
+    message: al.message,
+    createdAt: al.createdAt.toISOString(),
+    read: al.readAt != null,
+  }));
+  const unreadCount = alerts.filter((a) => !a.read).length;
+
+  // Plan + cap. Soft-gate model: we do NOT force-redirect a merchant without a
+  // plan (the activation moment must precede the paywall). We only read the cap
+  // here to show "X / Y tracked" and to feed the action's tracking gate. The
+  // tracked count is what the gate counts (status != rejected), identical to
+  // the `tracked` query above, so the displayed number and the enforced number
+  // can't disagree.
+  const plan = await getPlanInfo(billing);
+  const storeHandle = shop.replace(".myshopify.com", "");
+  const upgradeUrl = `https://admin.shopify.com/store/${storeHandle}/charges/${APP_HANDLE}/pricing_plans`;
+
+  return {
+    currency: data?.shop?.currencyCode ?? "",
+    products,
+    tracked,
+    alerts,
+    unreadCount,
+    planName: plan.planName,
+    cap: plan.cap,
+    isUnlimited: plan.isUnlimited,
+    trackedCount: tracked.length,
+    upgradeUrl,
+  };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { session, billing } = await authenticate.admin(request);
   const shop = session.shop;
 
   const form = await request.formData();
   const intent = String(form.get("intent") || "match");
 
-  // --- Status update (confirm / reject) — patches the Match, no re-scrape.
+  // --- Status update (confirm / reject) -- patches the Match, no re-scrape.
   if (intent === "setStatus") {
     const matchId = String(form.get("matchId") || "");
     const status = String(form.get("status") || "");
@@ -133,7 +193,39 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { result: null, error: null, saved: false };
   }
 
+  // --- Dismiss an alert (set readAt). Row kept for audit / history.
+  if (intent === "dismissAlert") {
+    const alertId = String(form.get("alertId") || "");
+    if (alertId) {
+      await prisma.alert.updateMany({
+        where: { id: alertId, shop },
+        data: { readAt: new Date() },
+      });
+    }
+    return { result: null, error: null, saved: false };
+  }
+
+  // --- Discover: ask the engine for candidate competitor URLs for the selected
+  //     product. URLs ONLY -- no fetch, no match, no DB write here. The merchant
+  //     then clicks "Check" on the ones they want, routing each through the same
+  //     match+persist path manual paste uses (no second decision route). This is
+  //     the differentiator: the merchant never types a competitor URL.
+  if (intent === "discover") {
+    let merchant: Record<string, unknown> = {};
+    try {
+      merchant = JSON.parse(String(form.get("product") || "{}"));
+    } catch {
+      merchant = {};
+    }
+    const { candidates, queries, error } = await discoverCompetitors({ merchant });
+    return { discover: { candidates, queries, error } };
+  }
+
   // --- Default: match a competitor URL against a merchant product.
+  //     The engine call + persist is the shared recheckMatch path so the
+  //     scheduler runs the exact same code (no drift). We resolve the plan cap
+  //     here (UI path has a session) and pass it so a NEW competitor over the
+  //     limit is blocked before persist; the scheduler omits it (no gate).
   const competitorUrl = String(form.get("competitorUrl") || "").trim();
   let merchant: Record<string, unknown> = {};
   try {
@@ -142,95 +234,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     merchant = {};
   }
 
-  if (!competitorUrl) {
-    return { result: null, error: "Enter a competitor product URL.", saved: false };
-  }
-
-  // 1) Ask the engine for a match decision.
-  let result: any = null;
-  try {
-    const res = await fetch(`${ENGINE_URL}/match`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        merchant,
-        candidates: [{ url: competitorUrl }],
-      }),
-    });
-    const data = (await res.json()) as any;
-    if (data.error) return { result: null, error: data.error, saved: false };
-    result = data.results?.[0] ?? null;
-  } catch (e: any) {
-    return {
-      result: null,
-      error: `Could not reach the engine service at ${ENGINE_URL}. Is "python serve.py" running? (${e?.message ?? e})`,
-      saved: false,
-    };
-  }
-
-  if (!result) {
-    return { result: null, error: "The engine returned no result for that URL.", saved: false };
-  }
-
-  // 2) Persist the decision (a Match) and, if we're tracking it, a price reading
-  //    (an Observation). A DB failure here must not hide a good match from the
-  //    merchant, so this is isolated and the result is returned either way.
-  let saved = false;
-  try {
-    const productGid = String((merchant as any).id ?? "");
-    const productTitle = String((merchant as any).title ?? "(untitled)");
-    let competitorHost: string | null = null;
-    try {
-      competitorHost = new URL(competitorUrl).host;
-    } catch {
-      competitorHost = null;
-    }
-
-    if (productGid) {
-      const match = await prisma.match.upsert({
-        where: {
-          shop_productGid_competitorUrl: { shop, productGid, competitorUrl },
-        },
-        update: {
-          productTitle,
-          competitorHost,
-          confidence: Number(result.confidence ?? 0),
-          method: String(result.method ?? ""),
-          status: String(result.status ?? "auto"),
-        },
-        create: {
-          shop,
-          productGid,
-          productTitle,
-          competitorUrl,
-          competitorHost,
-          confidence: Number(result.confidence ?? 0),
-          method: String(result.method ?? ""),
-          status: String(result.status ?? "auto"),
-        },
-      });
-
-      // Record a reading for any tracked (non-rejected) source — including a
-      // null price, which is the signal silent-failure detection looks for.
-      if (result.status !== "rejected") {
-        await prisma.observation.create({
-          data: {
-            matchId: match.id,
-            price: result.price != null ? Number(result.price) : null,
-            currency: result.currency ?? null,
-            inStock: typeof result.in_stock === "boolean" ? result.in_stock : null,
-            via: result.extracted_via ?? null,
-          },
-        });
-      }
-      saved = true;
-    }
-  } catch (e) {
-    console.error("Persist failed:", e);
-    saved = false;
-  }
-
-  return { result, error: null, saved };
+  const plan = await getPlanInfo(billing);
+  return await recheckMatch({ shop, merchant, competitorUrl, cap: plan.cap });
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -240,17 +245,47 @@ const STATUS_LABEL: Record<string, string> = {
   rejected: "Not the same product",
 };
 
+const ALERT_LABEL: Record<string, string> = {
+  price_drop: "Price drop",
+  back_in_stock: "Back in stock",
+};
+
 export default function Index() {
-  const { currency, products, tracked } = useLoaderData<typeof loader>();
+  const {
+    currency,
+    products,
+    tracked,
+    alerts,
+    unreadCount,
+    cap,
+    isUnlimited,
+    trackedCount,
+    upgradeUrl,
+  } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const [selected, setSelected] = useState(0);
   const [url, setUrl] = useState("");
 
   const busy = fetcher.state !== "idle";
-  const data = fetcher.data;
+  const data = fetcher.data as any;
   const r = data?.result;
+  const discover = data?.discover;
+  const atLimit = data?.atLimit === true;
 
-  // Submit helper — builds explicit FormData so the fields can never be dropped
+  // Human-readable cap for display. UNLIMITED renders as the word, never a
+  // number, matching the billing.server sentinel.
+  const capLabel = isUnlimited ? "unlimited" : String(cap);
+
+  // Send the merchant to the managed-pricing plan page. Embedded apps live in
+  // an iframe and can't navigate the parent, so this opens the admin URL at the
+  // top level. (open with _top mirrors the documented redirect target.)
+  const goUpgrade = () => {
+    if (typeof window !== "undefined") {
+      window.open(upgradeUrl, "_top");
+    }
+  };
+
+  // Submit helper -- builds explicit FormData so the fields can never be dropped
   // by object-shorthand serialization. Refuses to submit an empty URL.
   const runCheck = (productJson: string, competitorUrl: string) => {
     if (!competitorUrl.trim()) return;
@@ -264,6 +299,25 @@ export default function Index() {
     const product = products[selected];
     if (!product) return;
     runCheck(JSON.stringify(product), url);
+  };
+
+  // Find competitors for the selected product (discovery). Returns URLs the
+  // merchant then checks individually -- no URL typing required.
+  const findCompetitors = () => {
+    const product = products[selected];
+    if (!product) return;
+    const fd = new FormData();
+    fd.set("intent", "discover");
+    fd.set("product", JSON.stringify(product));
+    fetcher.submit(fd, { method: "POST" });
+  };
+
+  // Check a discovered candidate against the currently selected product, reusing
+  // the proven manual-check path.
+  const checkCandidate = (candidateUrl: string) => {
+    const product = products[selected];
+    if (!product) return;
+    runCheck(JSON.stringify(product), candidateUrl);
   };
 
   const recheck = (t: (typeof tracked)[number]) => {
@@ -280,13 +334,25 @@ export default function Index() {
     fetcher.submit(fd, { method: "POST" });
   };
 
+  const dismissAlert = (alertId: string) => {
+    const fd = new FormData();
+    fd.set("intent", "dismissAlert");
+    fd.set("alertId", alertId);
+    fetcher.submit(fd, { method: "POST" });
+  };
+
   return (
     <s-page heading="Price Engine">
-      <s-section heading="Check a competitor">
+      <s-section heading="Find competitors">
         <s-paragraph>
-          Pick one of your products, paste a competitor&apos;s product-page URL,
-          and Price Engine will read its price and decide whether it&apos;s the
-          same product.
+          Pick one of your products and let Price Engine find competitors selling
+          it -- no URL hunting. Review the candidates it finds and track the ones
+          that matter with one tap. (Or paste a specific competitor URL below.)
+        </s-paragraph>
+
+        <s-paragraph>
+          Tracking {trackedCount} of {capLabel} competitor
+          {capLabel === "1" ? "" : "s"} on your current plan.
         </s-paragraph>
 
         <s-stack direction="block" gap="base">
@@ -305,8 +371,17 @@ export default function Index() {
             </select>
           </label>
 
+          <s-stack direction="inline" gap="base">
+            <s-button
+              onClick={findCompetitors}
+              {...(busy ? { loading: true } : {})}
+            >
+              Find competitors
+            </s-button>
+          </s-stack>
+
           <label>
-            <s-text>Competitor product URL</s-text>
+            <s-text>Or paste a competitor product URL</s-text>
             <input
               type="url"
               value={url}
@@ -326,10 +401,79 @@ export default function Index() {
           </s-stack>
         </s-stack>
 
+        {/* Plan-limit prompt. Shown when the action blocked a NEW competitor
+            because the shop is at its cap. The match still ran (the merchant
+            sees it worked just below); only tracking is gated. The upgrade
+            button sends them to the managed-pricing plan page. */}
+        {atLimit && (
+          <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
+            <s-stack direction="block" gap="base">
+              <s-text>
+                You're tracking {data?.tracked ?? trackedCount} of {capLabel} competitors -
+                your plan's limit. This match wasn't tracked. Upgrade to track
+                more competitors.
+              </s-text>
+              <s-stack direction="inline" gap="base">
+                <s-button variant="primary" onClick={goUpgrade}>
+                  Upgrade plan
+                </s-button>
+              </s-stack>
+            </s-stack>
+          </s-box>
+        )}
+
         {data?.error && (
           <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
             <s-text>! {data.error}</s-text>
           </s-box>
+        )}
+
+        {/* Discovery results: candidate URLs the merchant can check one-tap.
+            Each routes through the same match path as manual paste. */}
+        {discover && (
+          <s-section
+            heading={
+              discover.candidates.length > 0
+                ? `Found ${discover.candidates.length} possible competitor page(s)`
+                : "No competitors found"
+            }
+          >
+            {discover.error ? (
+              <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
+                <s-text>
+                  Discovery unavailable: {discover.error}
+                </s-text>
+              </s-box>
+            ) : discover.candidates.length === 0 ? (
+              <s-paragraph>
+                No candidate pages came back for this product. Try a different
+                product, or paste a competitor URL directly above.
+              </s-paragraph>
+            ) : (
+              <s-stack direction="block" gap="base">
+                <s-text>
+                  Click Check on any that look like a real competitor selling
+                  this product. Price Engine reads each page and decides if
+                  it&apos;s the same item.
+                </s-text>
+                {discover.candidates.map((cu: string) => (
+                  <s-box key={cu} padding="base" borderWidth="base" borderRadius="base">
+                    <s-stack direction="block" gap="base">
+                      <s-text>{cu}</s-text>
+                      <s-stack direction="inline" gap="base">
+                        <s-button
+                          onClick={() => checkCandidate(cu)}
+                          {...(busy ? { loading: true } : {})}
+                        >
+                          Check
+                        </s-button>
+                      </s-stack>
+                    </s-stack>
+                  </s-box>
+                ))}
+              </s-stack>
+            )}
+          </s-section>
         )}
 
         {r && (
@@ -349,6 +493,11 @@ export default function Index() {
               {Array.isArray(r.reasons) && r.reasons.length > 0 && (
                 <s-text>Why: {r.reasons.join("; ")}</s-text>
               )}
+              {atLimit && (
+                <s-text>
+                  Not tracked - you're at your plan's competitor limit (see above).
+                </s-text>
+              )}
               {data?.saved && r.status !== "rejected" && (
                 <s-text>Saved - now tracking this competitor&apos;s price.</s-text>
               )}
@@ -360,10 +509,53 @@ export default function Index() {
         )}
       </s-section>
 
+      <s-section heading={unreadCount > 0 ? `Alerts (${unreadCount} unread)` : "Alerts"}>
+        {alerts.length === 0 ? (
+          <s-paragraph>
+            No alerts yet. Confirmed competitors that drop in price or come back
+            in stock will show up here.
+          </s-paragraph>
+        ) : (
+          <s-stack direction="block" gap="base">
+            {alerts.map((a) => (
+              <s-box
+                key={a.id}
+                padding="base"
+                borderWidth="base"
+                borderRadius="base"
+                {...(a.read ? { background: "subdued" } : {})}
+              >
+                <s-stack direction="block" gap="base">
+                  <s-text>
+                    {a.read ? "" : "* "}
+                    {a.message}
+                  </s-text>
+                  <s-text>
+                    {ALERT_LABEL[a.type] ?? a.type} -{" "}
+                    {new Date(a.createdAt).toLocaleString()}
+                    {a.read ? " - dismissed" : ""}
+                  </s-text>
+                  {!a.read && (
+                    <s-stack direction="inline" gap="base">
+                      <s-button
+                        onClick={() => dismissAlert(a.id)}
+                        {...(busy ? { loading: true } : {})}
+                      >
+                        Dismiss
+                      </s-button>
+                    </s-stack>
+                  )}
+                </s-stack>
+              </s-box>
+            ))}
+          </s-stack>
+        )}
+      </s-section>
+
       <s-section heading={`Tracked competitors (${tracked.length})`}>
         {tracked.length === 0 ? (
           <s-paragraph>
-            No saved competitors yet. Check one above to start tracking it.
+            No saved competitors yet. Find or check one above to start tracking it.
           </s-paragraph>
         ) : (
           <s-stack direction="block" gap="base">
@@ -390,9 +582,20 @@ export default function Index() {
                           : ""}
                     </s-text>
 
-                    {/* Price movement since the previous reading */}
+                    {/* Price movement / source health since the previous reading.
+                        A sustained no-price streak (>=2) takes priority over the
+                        single-check "disappeared" blip. */}
                     {t.observationCount < 2 ? (
                       <s-text>First reading - no comparison yet.</s-text>
+                    ) : t.consecutiveNulls >= 2 ? (
+                      <s-text>
+                        Source may be broken: the last {t.consecutiveNulls}{" "}
+                        checks found no price
+                        {t.lastKnownPrice != null
+                          ? ` (last known price ${t.lastKnownCurrency ?? ""} ${t.lastKnownPrice})`
+                          : ""}
+                        . The page layout or scraper likely changed.
+                      </s-text>
                     ) : t.priceDisappeared ? (
                       <s-text>
                         Warning: no price found this check (last was{" "}

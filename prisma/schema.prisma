@@ -1,19 +1,15 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
-
 // Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
 // enough when changing adapters.
 // See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
-
 datasource db {
   provider = "sqlite"
   url      = "file:dev.sqlite"
 }
-
 model Session {
   id            String    @id
   shop          String
@@ -33,50 +29,65 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
-
 // --- Price Engine persistence (HANDOFF #1) ---------------------------------
-// Mirrors price_engine/models.py (Match, Observation) and plan §5.
+// Mirrors price_engine/models.py (Match, Observation) and plan section 5.
 // A Match is one tracked merchant-product <-> competitor-URL pair plus the
 // engine's decision about it. Observations are its price/stock time series.
-
 model Match {
   id             String   @id @default(cuid())
   shop           String
-
-  // merchant product — live Shopify catalog is source of truth; snapshot kept
+  // merchant product - live Shopify catalog is source of truth; snapshot kept
   // for display and so a scheduled re-check can run without the merchant present
   productGid     String   // Shopify product GID, e.g. gid://shopify/Product/123
   productTitle   String
-
+  // merchant identifiers captured at match time so the unattended scheduler can
+  // rebuild the engine's merchant object with no Shopify session. Nullable -
+  // not every product carries all three.
+  productBrand   String?
+  productGtin    String?
+  productSku     String?
   // competitor side
   competitorUrl  String
   competitorHost String?  // derived host, for per-source health grouping (observe.py)
-
   // engine /match decision
   confidence     Float
   method         String   // identifier | lexical | identifier-conflict | dom-lexical | ...
   status         String   @default("auto") // auto | confirmed | rejected | needs_review
-
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
-
   observations   Observation[]
-
+  alerts         Alert[]
   @@unique([shop, productGid, competitorUrl])
   @@index([shop])
 }
-
 model Observation {
   id        String   @id @default(cuid())
   matchId   String
   match     Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
-
   price     Float?   // nullable: a no-price read is still an observation (silent-failure detection)
   currency  String?  // stored raw, no normalization (currency decision is read-side)
   inStock   Boolean?
-  via       String?  // jsonld | dom — extraction path, useful for source health
-
+  via       String?  // jsonld | dom - extraction path, useful for source health
   scrapedAt DateTime @default(now())
-
   @@index([matchId, scrapedAt])
+}
+// An Alert is a durable event emitted when a new reading reveals a triggering
+// transition vs the prior reading (price_drop, back_in_stock). Written by
+// recheckMatch so the scheduler fires them unattended; the UI feed and a later
+// email job both read these rows. Self-contained snapshot (message/old/new) so
+// neither consumer has to re-derive from observations.
+model Alert {
+  id        String   @id @default(cuid())
+  shop      String
+  matchId   String
+  match     Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  type      String   // price_drop | back_in_stock
+  message   String
+  oldValue  String?  // prior price or stock state, as text
+  newValue  String?  // new price or stock state, as text
+  currency  String?
+  createdAt DateTime  @default(now())
+  readAt    DateTime? // null = unread; set when the merchant dismisses it
+  @@index([shop, createdAt])
+  @@index([matchId])
 }
