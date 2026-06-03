@@ -3,7 +3,7 @@ import { decideAlerts } from "./alerts";
 import { UNLIMITED } from "./billing.server";
 
 // The local Python engine service (serve.py). Server-side call only.
-export const ENGINE_URL = "http://127.0.0.1:8787";
+export const ENGINE_URL = process.env.ENGINE_URL ?? "http://127.0.0.1:8787";
 
 export type RecheckResult = {
   result: any;
