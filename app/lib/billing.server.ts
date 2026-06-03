@@ -1,11 +1,11 @@
-import type { authenticate } from "../shopify.server";
+﻿import type { authenticate } from "../shopify.server";
 
 // Plan -> competitor cap, for Shopify Managed App Pricing.
 //
 // Managed pricing means plans are defined in the Partner Dashboard (App ->
 // Pricing), NOT in code or shopify.app.toml. The library still exposes the
 // active plan name via `billing.check`. This file is the ONE place that maps
-// those plan names to what they unlock (the §7 competitor cap), so there is a
+// those plan names to what they unlock (the Â§7 competitor cap), so there is a
 // single source of truth and no magic numbers scattered through the gate.
 //
 // >>> FILL THIS IN <<<
@@ -13,7 +13,7 @@ import type { authenticate } from "../shopify.server";
 // BYTE-FOR-BYTE (case, spacing, punctuation). `billing.check` returns the plan
 // name as a string; if it doesn't match a key here, the merchant silently falls
 // back to FREE_CAP. After creating the plans, set these four keys to the exact
-// names shown in the dashboard. The cap values are the §7 tiers:
+// names shown in the dashboard. The cap values are the Â§7 tiers:
 //   Free = 3, $29 = 10, $59 = 25, $99 = unlimited.
 // UNLIMITED is a sentinel, not a real number, so "unlimited" can never be
 // off-by-one against a large literal.

@@ -1,4 +1,4 @@
-import prisma from "../db.server";
+﻿import prisma from "../db.server";
 import { decideAlerts } from "./alerts";
 import { UNLIMITED } from "./billing.server";
 
@@ -279,3 +279,5 @@ export async function discoverCompetitors(params: {
     };
   }
 }
+
+
