@@ -2,7 +2,7 @@
 
 client_id = "65db6ab1bb2732a3786913bb4c781808"
 name = "Price Engine"
-application_url = "https://localhost:3000"
+application_url = "https://price-engine-sepia.vercel.app"
 embedded = true
 
 [access_scopes]
@@ -12,10 +12,13 @@ optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ "https://localhost:3000/auth/callback" ]
+redirect_urls = [ "https://price-engine-sepia.vercel.app/auth/callback" ]
 
 [webhooks]
 api_version = "2026-04"
 
 [build]
-automatically_update_urls_on_dev = true
+automatically_update_urls_on_dev = false
+
+
+
