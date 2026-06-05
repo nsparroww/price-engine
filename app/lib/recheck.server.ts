@@ -1,9 +1,26 @@
-﻿import prisma from "../db.server";
+import prisma from "../db.server";
 import { decideAlerts } from "./alerts";
 import { UNLIMITED } from "./billing.server";
 
 // The local Python engine service (serve.py). Server-side call only.
 export const ENGINE_URL = process.env.ENGINE_URL ?? "http://127.0.0.1:8787";
+
+// Shared secret for the engine's POST routes. Sent on every engine call as the
+// X-Engine-Secret header. Unset locally (serve.py runs open on 127.0.0.1) -> no
+// header, which is correct: the local engine doesn't enforce. Set in production
+// (Vercel env) so that, once the deployed engine has the matching RECHECK_SECRET
+// configured, it accepts our calls and 401s everyone else. The two sides must
+// hold the SAME value.
+const ENGINE_SECRET = process.env.RECHECK_SECRET ?? "";
+
+// Build the headers for an engine call. Always JSON; attach the secret only
+// when one is configured, so local dev (no secret) sends a bare Content-Type
+// and production sends the shared secret.
+function engineHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (ENGINE_SECRET) headers["X-Engine-Secret"] = ENGINE_SECRET;
+  return headers;
+}
 
 export type RecheckResult = {
   result: any;
@@ -56,7 +73,7 @@ export async function recheckMatch(params: {
   try {
     const res = await fetch(`${ENGINE_URL}/match`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: engineHeaders(),
       body: JSON.stringify({
         merchant,
         candidates: [{ url: competitorUrl }],
@@ -262,7 +279,7 @@ export async function discoverCompetitors(params: {
   try {
     const res = await fetch(`${ENGINE_URL}/discover`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: engineHeaders(),
       body: JSON.stringify({ merchant }),
     });
     const data = (await res.json()) as any;
@@ -279,5 +296,3 @@ export async function discoverCompetitors(params: {
     };
   }
 }
-
-
