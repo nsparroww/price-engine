@@ -1,79 +1,110 @@
-﻿import type { authenticate } from "../shopify.server";
+import type { authenticate } from "../shopify.server";
 
-// Plan -> competitor cap, for Shopify Managed App Pricing.
+// Plan -> competitor cap, for Shopify Managed App Pricing (now "Shopify App
+// Pricing"). Plans are defined in the Partner Dashboard (app listing ->
+// Pricing), NOT in code. This file is the ONE place that maps a plan to what it
+// unlocks (the plan's competitor cap), so there is a single source of truth and
+// no magic numbers scattered through the gate.
 //
-// Managed pricing means plans are defined in the Partner Dashboard (App ->
-// Pricing), NOT in code or shopify.app.toml. The library still exposes the
-// active plan name via `billing.check`. This file is the ONE place that maps
-// those plan names to what they unlock (the Â§7 competitor cap), so there is a
-// single source of truth and no magic numbers scattered through the gate.
+// WHY WE KEY ON THE PLAN *HANDLE*, NOT THE DISPLAY NAME:
+// activeSubscriptions exposes the plan's `name`, but that name is LOCALIZED per
+// merchant -- a Dutch merchant on "Growth" can come back as a translated string,
+// which would miss an English key here and silently drop the merchant to
+// FREE_CAP. The plan *handle* (the lowercase slug shown above each plan's
+// Display Name field in the dashboard: free / starter / growth / unlimited) does
+// NOT localize. We read it from
+// activeSubscriptions.lineItems.plan.pricingDetails.planHandle (requires API
+// version July25+; we are on October25).
 //
-// >>> FILL THIS IN <<<
-// The KEYS below must match the plan names you create in the Partner Dashboard
-// BYTE-FOR-BYTE (case, spacing, punctuation). `billing.check` returns the plan
-// name as a string; if it doesn't match a key here, the merchant silently falls
-// back to FREE_CAP. After creating the plans, set these four keys to the exact
-// names shown in the dashboard. The cap values are the Â§7 tiers:
-//   Free = 3, $29 = 10, $59 = 25, $99 = unlimited.
-// UNLIMITED is a sentinel, not a real number, so "unlimited" can never be
-// off-by-one against a large literal.
+// The KEYS below MUST match the plan handles byte-for-byte (lowercase slugs).
+// The cap values are the plan tiers: free=3, starter=10, growth=25,
+// unlimited=UNLIMITED. UNLIMITED is a sentinel, not a literal, so "unlimited"
+// can never be off-by-one against a large number.
 export const UNLIMITED = Number.POSITIVE_INFINITY;
 
 export const PLAN_CAPS: Record<string, number> = {
-  // "<exact Free plan name>": 3,
-  // "<exact $29 plan name>": 10,
-  // "<exact $59 plan name>": 25,
-  // "<exact $99 plan name>": UNLIMITED,
+  free: 3,
+  starter: 10,
+  growth: 25,
+  unlimited: UNLIMITED,
 };
 
-// The cap a merchant gets with no active paid subscription. Managed pricing's
-// free tier may or may not surface as a named plan in `billing.check`; either
-// way, "no recognized active plan" must resolve to the free allowance, never to
-// unlimited. This is the safe-by-default floor.
+// The cap a merchant gets with no recognized active plan. "No identifiable paid
+// plan" must resolve to the free allowance, never to unlimited -- the
+// safe-by-default floor. Also the floor when planHandle comes back null (a known
+// managed-pricing edge case) -- failing closed is the correct behavior there.
 export const FREE_CAP = 3;
 
-// Shape of the object returned by `authenticate.admin(request)`. We only need
-// its `billing` member, so we derive the type from the real function rather
-// than hand-rolling it (keeps us correct across library minor versions).
+// Shape of the object returned by authenticate.admin(request). We need its
+// `admin` GraphQL client -- the plan handle only comes from a GraphQL query, not
+// from billing.check(). Derived from the real function so we stay correct across
+// library minor versions.
 type AdminContext = Awaited<ReturnType<typeof authenticate.admin>>;
-type BillingContext = AdminContext["billing"];
+type AdminApiContext = AdminContext["admin"];
 
 export type PlanInfo = {
-  planName: string | null; // the active plan's name, or null if none/unknown
+  planName: string | null; // the active plan HANDLE, or null if none/unknown
   cap: number; // resolved competitor cap (FREE_CAP when unknown)
   isUnlimited: boolean;
 };
 
-// Read the merchant's active plan and resolve it to a competitor cap.
+// Read the merchant's active plan handle and resolve it to a competitor cap.
 //
-// `billing.check()` with no `plans` filter returns the merchant's current
-// subscriptions. We take the first active subscription's name and look it up in
-// PLAN_CAPS. Anything we can't positively identify as a paid plan resolves to
-// the free floor -- failing OPEN to "more access" on a billing read would let a
-// merchant track unlimited competitors for free, so we fail CLOSED to FREE_CAP.
-export async function getPlanInfo(billing: BillingContext): Promise<PlanInfo> {
-  let planName: string | null = null;
+// activeSubscriptions returns the merchant's current subscriptions; we read the
+// recurring plan handle off the first active one. Anything we can't positively
+// identify as a known paid handle resolves to the free floor -- failing OPEN on
+// a billing read would let a merchant track unlimited competitors for free, so
+// we fail CLOSED to FREE_CAP.
+export async function getPlanInfo(admin: AdminApiContext): Promise<PlanInfo> {
+  let planHandle: string | null = null;
 
   try {
-    // No `plans` argument => "what does this merchant currently have?" rather
-    // than "do they have plan X?". We read the name off the first active sub.
-    const result: any = await billing.check();
-    const subs: any[] = result?.appSubscriptions ?? [];
+    const resp = await admin.graphql(
+      `#graphql
+        query ActivePlanHandle {
+          currentAppInstallation {
+            activeSubscriptions {
+              status
+              lineItems {
+                plan {
+                  pricingDetails {
+                    __typename
+                    ... on AppRecurringPricing {
+                      planHandle
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }`,
+    );
+    const json: any = await resp.json();
+    const subs: any[] =
+      json?.data?.currentAppInstallation?.activeSubscriptions ?? [];
     const active = subs.find((s) => s?.status === "ACTIVE") ?? subs[0] ?? null;
-    planName = active?.name ?? null;
+    // First line item exposing a recurring plan handle wins. (Our plans are
+    // single-line-item, but iterate to be safe against multi-line plans.)
+    for (const li of active?.lineItems ?? []) {
+      const h = li?.plan?.pricingDetails?.planHandle;
+      if (typeof h === "string" && h.length > 0) {
+        planHandle = h;
+        break;
+      }
+    }
   } catch (e) {
     // A billing read failure must not break the page or silently grant access.
     // Treat it as "unknown plan" -> free floor.
-    console.error("billing.check failed; defaulting to free cap:", e);
-    planName = null;
+    console.error("plan-handle query failed; defaulting to free cap:", e);
+    planHandle = null;
   }
 
-  if (planName && planName in PLAN_CAPS) {
-    const cap = PLAN_CAPS[planName];
-    return { planName, cap, isUnlimited: cap === UNLIMITED };
+  if (planHandle && planHandle in PLAN_CAPS) {
+    const cap = PLAN_CAPS[planHandle];
+    return { planName: planHandle, cap, isUnlimited: cap === UNLIMITED };
   }
 
-  return { planName, cap: FREE_CAP, isUnlimited: FREE_CAP === UNLIMITED };
+  return { planName: planHandle, cap: FREE_CAP, isUnlimited: FREE_CAP === UNLIMITED };
 }
 
 // Convenience for the gate: given a current tracked count and a cap, can the

@@ -29,7 +29,7 @@ type CatalogProduct = {
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin, session, billing } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
   const response = await admin.graphql(
@@ -152,7 +152,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // tracked count is what the gate counts (status != rejected), identical to
   // the `tracked` query above, so the displayed number and the enforced number
   // can't disagree.
-  const plan = await getPlanInfo(billing);
+  const plan = await getPlanInfo(admin);
   const storeHandle = shop.replace(".myshopify.com", "");
   const upgradeUrl = `https://admin.shopify.com/store/${storeHandle}/charges/${APP_HANDLE}/pricing_plans`;
 
@@ -171,7 +171,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session, billing } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
   const form = await request.formData();
@@ -234,7 +234,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     merchant = {};
   }
 
-  const plan = await getPlanInfo(billing);
+  const plan = await getPlanInfo(admin);
   return await recheckMatch({ shop, merchant, competitorUrl, cap: plan.cap });
 };
 
