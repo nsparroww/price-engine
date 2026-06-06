@@ -12,12 +12,13 @@ import { recheckMatch, discoverCompetitors } from "../lib/recheck.server";
 import { getPlanInfo, UNLIMITED } from "../lib/billing.server";
 
 // App handle for building the managed-pricing plan-selection URL. This is the
-// slug Shopify assigns the app (Partner Dashboard -> your app -> the URL slug),
-// NOT necessarily the display name. The plan page lives at
+// handle Shopify assigns the app -- read it from the admin URL while the app is
+// open: admin.shopify.com/store/<store>/apps/<THIS>. It is NOT the dashboard
+// display slug; Shopify appends a disambiguating suffix (here, "-5"). The plan
+// page lives at
 //   https://admin.shopify.com/store/<storeHandle>/charges/<APP_HANDLE>/pricing_plans
-// A wrong handle 404s on the upgrade click, so confirm it in the dashboard.
-// >>> FILL THIS IN <<<
-const APP_HANDLE = "price-engine";
+// A wrong handle 404s on the upgrade click.
+const APP_HANDLE = "price-engine-5";
 
 type CatalogProduct = {
   id: string;
@@ -250,6 +251,22 @@ const ALERT_LABEL: Record<string, string> = {
   back_in_stock: "Back in stock",
 };
 
+// Inline style for the upgrade/plan links. We use a raw <a target="_top">
+// rather than <s-button href> because (a) breaking OUT of the embedded iframe
+// to an admin URL needs a real top-level navigation, which a user-clicked
+// anchor does reliably across browsers (Safari blocks programmatic
+// window.open from the iframe), and (b) Polaris s-button/s-link href has known
+// redirect bugs inside React Router apps. Styled to read as a primary button.
+const UPGRADE_LINK_STYLE: React.CSSProperties = {
+  display: "inline-block",
+  padding: "8px 16px",
+  background: "#008060",
+  color: "white",
+  borderRadius: "8px",
+  textDecoration: "none",
+  fontWeight: 600,
+};
+
 export default function Index() {
   const {
     currency,
@@ -275,15 +292,6 @@ export default function Index() {
   // Human-readable cap for display. UNLIMITED renders as the word, never a
   // number, matching the billing.server sentinel.
   const capLabel = isUnlimited ? "unlimited" : String(cap);
-
-  // Send the merchant to the managed-pricing plan page. Embedded apps live in
-  // an iframe and can't navigate the parent, so this opens the admin URL at the
-  // top level. (open with _top mirrors the documented redirect target.)
-  const goUpgrade = () => {
-    if (typeof window !== "undefined") {
-      window.open(upgradeUrl, "_top");
-    }
-  };
 
   // Submit helper -- builds explicit FormData so the fields can never be dropped
   // by object-shorthand serialization. Refuses to submit an empty URL.
@@ -355,6 +363,16 @@ export default function Index() {
           {capLabel === "1" ? "" : "s"} on your current plan.
         </s-paragraph>
 
+        {/* Persistent path to the managed-pricing plan page. Always visible so
+            both merchants and the App Store reviewer can reach billing without
+            first hitting the cap. target="_top" breaks out of the embedded
+            iframe to the Shopify-hosted plan selector. */}
+        <s-stack direction="inline" gap="base">
+          <a href={upgradeUrl} target="_top" style={UPGRADE_LINK_STYLE}>
+            {isUnlimited ? "Manage plan" : "View plans"}
+          </a>
+        </s-stack>
+
         <s-stack direction="block" gap="base">
           <label>
             <s-text>Your product</s-text>
@@ -404,7 +422,7 @@ export default function Index() {
         {/* Plan-limit prompt. Shown when the action blocked a NEW competitor
             because the shop is at its cap. The match still ran (the merchant
             sees it worked just below); only tracking is gated. The upgrade
-            button sends them to the managed-pricing plan page. */}
+            link sends them to the managed-pricing plan page. */}
         {atLimit && (
           <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
             <s-stack direction="block" gap="base">
@@ -414,9 +432,9 @@ export default function Index() {
                 more competitors.
               </s-text>
               <s-stack direction="inline" gap="base">
-                <s-button variant="primary" onClick={goUpgrade}>
+                <a href={upgradeUrl} target="_top" style={UPGRADE_LINK_STYLE}>
                   Upgrade plan
-                </s-button>
+                </a>
               </s-stack>
             </s-stack>
           </s-box>
