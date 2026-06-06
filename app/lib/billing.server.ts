@@ -27,6 +27,7 @@ export const PLAN_CAPS: Record<string, number> = {
   starter: 10,
   growth: 25,
   unlimited: UNLIMITED,
+  "shopify-test": 10, // TEST private plan ($0) -- strip before launch
 };
 
 // The cap a merchant gets with no recognized active plan. "No identifiable paid
