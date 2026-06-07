@@ -17,6 +17,10 @@ redirect_urls = [ "https://price-engine-sepia.vercel.app/auth/callback" ]
 [webhooks]
 api_version = "2026-04"
 
+  [[webhooks.subscriptions]]
+  compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
+  uri = "/webhooks/app/compliance"
+
 [build]
 automatically_update_urls_on_dev = false
 
