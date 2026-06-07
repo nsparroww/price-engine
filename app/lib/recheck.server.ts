@@ -262,6 +262,30 @@ export type DiscoverResult = {
   error: string | null;
 };
 
+// Domains that are never a competitor storefront -- social, video, forums,
+// encyclopedias, blogs. Discovery search can surface these; we drop them so the
+// merchant only sees real product pages. Matched on the host (and any
+// subdomain), case-insensitive.
+const NON_STORE_HOSTS = new Set([
+  "youtube.com", "youtu.be", "reddit.com", "facebook.com", "instagram.com",
+  "twitter.com", "x.com", "tiktok.com", "pinterest.com", "quora.com",
+  "linkedin.com", "wikipedia.org", "medium.com", "tumblr.com",
+  "blogspot.com", "wordpress.com",
+]);
+
+function isStoreCandidate(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).host.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return false;
+  }
+  for (const bad of NON_STORE_HOSTS) {
+    if (host === bad || host.endsWith("." + bad)) return false;
+  }
+  return true;
+}
+
 // Ask the engine for candidate competitor URLs for a merchant product. URLs
 // ONLY -- no fetch, no match, no DB write here. The caller renders these and
 // lets the merchant run each through the existing manual "Check" path
@@ -272,6 +296,9 @@ export type DiscoverResult = {
 // A missing search-API key comes back from the engine as a non-null `error`
 // with an empty candidate list (HTTP 200), so the UI can show a setup prompt
 // rather than treat it as a crash.
+//
+// Candidates are filtered to real storefronts (isStoreCandidate) so obvious
+// non-shops -- YouTube, Reddit, social, wikis -- never reach the merchant.
 export async function discoverCompetitors(params: {
   merchant: Record<string, unknown>;
 }): Promise<DiscoverResult> {
@@ -284,7 +311,9 @@ export async function discoverCompetitors(params: {
     });
     const data = (await res.json()) as any;
     return {
-      candidates: Array.isArray(data.candidates) ? data.candidates : [],
+      candidates: (Array.isArray(data.candidates) ? data.candidates : []).filter(
+        (u: any) => typeof u === "string" && isStoreCandidate(u),
+      ),
       queries: Array.isArray(data.queries) ? data.queries : [],
       error: data.error ?? null,
     };
