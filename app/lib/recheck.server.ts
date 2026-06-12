@@ -193,6 +193,16 @@ export async function recheckMatch(params: {
       // engine's transient opinion.
       const effectiveStatus = match.status;
 
+      // Surface the EFFECTIVE persisted status back to the caller, overwriting
+      // the engine's transient opinion on the returned result. The UI keys its
+      // heading AND its "now tracking / not tracked" message off result.status,
+      // so without this a merchant-locked row renders a contradiction: a
+      // re-checked REJECTED competitor whose matcher now says "auto" would show
+      // "Match (auto-tracked) - now tracking", and a CONFIRMED row the matcher
+      // now rejects would show "Not the same product" while still tracked. The
+      // row's persisted status is the merchant-facing truth; show that.
+      result.status = effectiveStatus;
+
       // Record a reading for any tracked (non-rejected) source -- including a
       // null price, which is the signal silent-failure detection looks for.
       if (effectiveStatus !== "rejected") {
