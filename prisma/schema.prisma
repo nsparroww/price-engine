@@ -92,3 +92,14 @@ model Alert {
   @@index([matchId])
 }
 
+
+// Per-shop app state that is NOT Shopify-session state. Sessions rotate and can
+// be multiple per shop, so guards keyed to "this merchant, once ever" can't live
+// on Session. One row per shop. Currently holds the review-ask guard.
+model ShopState {
+  id            String    @id @default(cuid())
+  shop          String    @unique
+  reviewAskedAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import type {
   ActionFunctionArgs,
   HeadersFunction,
@@ -28,6 +28,23 @@ type CatalogProduct = {
   gtin: string | null;
   sku: string | null;
 };
+
+// Render an ISO timestamp client-side only. `new Date(iso).toLocaleString()`
+// formats in the SERVER's timezone/locale during SSR and the BROWSER's on the
+// client, so rendering it directly yields different text on each side and
+// breaks hydration (React #425 "text content does not match", which cascades
+// into #418/#423 and leaves the tree half-hydrated -- which in turn stops
+// effects like the review-ask from running). We render a fixed placeholder on
+// the server and during the first client render (both produce the same text,
+// so hydration matches), then swap in the localized string after mount. The
+// merchant sees THEIR local time, and there is no nondeterminism to mismatch.
+function ClientDate({ iso }: { iso: string }) {
+  const [text, setText] = useState<string | null>(null);
+  useEffect(() => {
+    setText(new Date(iso).toLocaleString());
+  }, [iso]);
+  return <>{text ?? "..."}</>;
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -157,6 +174,25 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const storeHandle = shop.replace(".myshopify.com", "");
   const upgradeUrl = `https://admin.shopify.com/store/${storeHandle}/charges/${APP_HANDLE}/pricing_plans`;
 
+  // Review-ask gate. The flywheel's compounding mechanic: ask for an App Store
+  // review at the first proven value moment -- an auto/confirmed competitor that
+  // has actually produced a price (the moat visibly delivered). Derived from
+  // `tracked` (already loaded) so it costs no extra query until that moment
+  // exists. needs_review is excluded on purpose: we only ask after a confident
+  // or merchant-confirmed match. The ShopState guard makes the ask fire at most
+  // once per merchant, ever -- and we only touch that table once there's
+  // something worth asking about.
+  const hasValueMoment = tracked.some(
+    (t) =>
+      (t.status === "auto" || t.status === "confirmed") &&
+      t.lastKnownPrice != null,
+  );
+  let reviewAsk = false;
+  if (hasValueMoment) {
+    const shopState = await prisma.shopState.findUnique({ where: { shop } });
+    reviewAsk = shopState?.reviewAskedAt == null;
+  }
+
   return {
     currency: data?.shop?.currencyCode ?? "",
     products,
@@ -168,6 +204,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     isUnlimited: plan.isUnlimited,
     trackedCount: tracked.length,
     upgradeUrl,
+    reviewAsk,
   };
 };
 
@@ -203,6 +240,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         data: { readAt: new Date() },
       });
     }
+    return { result: null, error: null, saved: false };
+  }
+
+  // --- Record that we've requested the in-app review modal, so it fires at
+  //     most once per merchant. The client calls this ONLY after App Bridge
+  //     reported the modal was actually shown (success === true). A
+  //     rate-limited / ineligible miss does NOT mark, so a later value-moment
+  //     load can retry until Shopify lets the modal through.
+  if (intent === "markReviewAsked") {
+    await prisma.shopState.upsert({
+      where: { shop },
+      update: { reviewAskedAt: new Date() },
+      create: { shop, reviewAskedAt: new Date() },
+    });
     return { result: null, error: null, saved: false };
   }
 
@@ -278,10 +329,16 @@ export default function Index() {
     isUnlimited,
     trackedCount,
     upgradeUrl,
+    reviewAsk,
   } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const [selected, setSelected] = useState(0);
   const [url, setUrl] = useState("");
+
+  // Dedicated fetcher for the review-ask mark, kept separate from `fetcher` so
+  // it never collides with the merchant's own actions (no spurious busy state).
+  const reviewFetcher = useFetcher();
+  const reviewAskedRef = useRef(false);
 
   const busy = fetcher.state !== "idle";
   const data = fetcher.data as any;
@@ -292,6 +349,37 @@ export default function Index() {
   // Human-readable cap for display. UNLIMITED renders as the word, never a
   // number, matching the billing.server sentinel.
   const capLabel = isUnlimited ? "unlimited" : String(cap);
+
+  // Fire the App Store review modal at the first value moment, once. This runs
+  // on the loader-driven `reviewAsk` transition (e.g. the revalidation right
+  // after a competitor auto-tracks), NOT in a button handler -- Shopify warns
+  // that triggering on a click can collide with rate-limiting and make the app
+  // look broken. App Bridge (window.shopify, the v4 CDN global) only shows the
+  // modal if its own eligibility/rate-limit checks pass; we mark "asked" only
+  // when it actually showed (success === true), so a throttled miss retries on
+  // a later value load instead of burning the one ask. The ref guards against
+  // re-entry within a single mount (StrictMode double-invoke, later
+  // revalidations); a fresh navigation remounts and may retry if still unmarked.
+  useEffect(() => {
+    if (!reviewAsk || reviewAskedRef.current) return;
+    reviewAskedRef.current = true;
+    (async () => {
+      let shown = false;
+      try {
+        const result = await (window as any).shopify?.reviews?.request();
+        shown = result?.success === true;
+      } catch {
+        shown = false;
+      }
+      if (shown) {
+        const fd = new FormData();
+        fd.set("intent", "markReviewAsked");
+        reviewFetcher.submit(fd, { method: "POST" });
+      }
+    })();
+    // reviewFetcher is stable; ref guards re-entry within a mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewAsk]);
 
   // Submit helper -- builds explicit FormData so the fields can never be dropped
   // by object-shorthand serialization. Refuses to submit an empty URL.
@@ -516,8 +604,11 @@ export default function Index() {
                   Not tracked - you're at your plan's competitor limit (see above).
                 </s-text>
               )}
-              {data?.saved && r.status !== "rejected" && (
+              {data?.saved && r.status !== "rejected" && r.status !== "needs_review" && (
                 <s-text>Saved - now tracking this competitor&apos;s price.</s-text>
+              )}
+              {data?.saved && r.status === "needs_review" && (
+                <s-text>Saved - pending your confirmation.</s-text>
               )}
               {data?.saved && r.status === "rejected" && (
                 <s-text>Saved this decision (not tracked).</s-text>
@@ -550,7 +641,7 @@ export default function Index() {
                   </s-text>
                   <s-text>
                     {ALERT_LABEL[a.type] ?? a.type} -{" "}
-                    {new Date(a.createdAt).toLocaleString()}
+                    <ClientDate iso={a.createdAt} />
                     {a.read ? " - dismissed" : ""}
                   </s-text>
                   {!a.read && (
@@ -638,9 +729,14 @@ export default function Index() {
 
                     <s-text>
                       {t.observationCount} reading{t.observationCount === 1 ? "" : "s"}
-                      {t.lastScrapedAt
-                        ? ` - last checked ${new Date(t.lastScrapedAt).toLocaleString()}`
-                        : ""}
+                      {t.lastScrapedAt ? (
+                        <>
+                          {" - last checked "}
+                          <ClientDate iso={t.lastScrapedAt} />
+                        </>
+                      ) : (
+                        ""
+                      )}
                     </s-text>
 
                     <s-stack direction="inline" gap="base">
