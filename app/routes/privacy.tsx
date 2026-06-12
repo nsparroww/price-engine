@@ -18,7 +18,7 @@ export const meta: MetaFunction = () => [
   },
 ];
 
-const LAST_UPDATED = "June 6, 2026";
+const LAST_UPDATED = "June 12, 2026";
 
 const pageStyle: React.CSSProperties = {
   maxWidth: "720px",
@@ -124,7 +124,7 @@ export default function Privacy() {
       <h2 style={h2Style}>Contact</h2>
       <p>
         Questions about this policy or your data? Contact us at{" "}
-        <a href="mailto:YOUR-REAL-EMAIL@example.com">YOUR-REAL-EMAIL@example.com</a>.
+        <a href="mailto:admin@trackaura.com">admin@trackaura.com</a>.
       </p>
     </main>
   );
