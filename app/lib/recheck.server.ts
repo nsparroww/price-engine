@@ -203,6 +203,18 @@ export async function recheckMatch(params: {
       // row's persisted status is the merchant-facing truth; show that.
       result.status = effectiveStatus;
 
+      // Mark when the displayed status is a STICKY MERCHANT decision (confirmed
+      // / rejected) rather than the engine's fresh call. result.confidence and
+      // result.reasons still carry the engine's live numbers, so a locked row
+      // would otherwise read as a contradiction -- a big confidence % sitting
+      // above "Not the same product" (or a tiny % under "Confirmed match") with
+      // nothing explaining the gap. The UI uses this flag to render that
+      // explanation and point at the reconsider affordance. True whenever the
+      // persisted status is merchant-locked, regardless of whether the engine
+      // now agrees, because the merchant did make that call either way.
+      result.merchantLocked =
+        existing != null && MERCHANT_LOCKED.has(existing.status);
+
       // Record a reading for any tracked (non-rejected) source -- including a
       // null price, which is the signal silent-failure detection looks for.
       if (effectiveStatus !== "rejected") {

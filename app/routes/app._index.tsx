@@ -148,6 +148,25 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     };
   });
 
+  // Rejected matches -- decisions the merchant (or the engine) marked "not a
+  // match." Excluded from `tracked` above, so without this they'd be invisible
+  // and there would be no way to reverse a rejection. We surface them in their
+  // own section with a one-tap "reconsider" that flips them back to
+  // needs_review. No observations needed here -- a rejected row isn't scraped,
+  // so there's nothing to show but the decision and how to undo it.
+  const rejectedRaw = await prisma.match.findMany({
+    where: { shop, status: "rejected" },
+    orderBy: { updatedAt: "desc" },
+  });
+  const rejected = rejectedRaw.map((m) => ({
+    id: m.id,
+    productGid: m.productGid,
+    productTitle: m.productTitle,
+    competitorUrl: m.competitorUrl,
+    competitorHost: m.competitorHost,
+    confidence: m.confidence,
+  }));
+
   // Recent alerts (newest first). Dismissed ones are kept (readAt set) and
   // shown greyed, for audit and so a later email job still sees history.
   const alertRows = await prisma.alert.findMany({
@@ -197,6 +216,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     currency: data?.shop?.currencyCode ?? "",
     products,
     tracked,
+    rejected,
     alerts,
     unreadCount,
     planName: plan.planName,
@@ -215,7 +235,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const form = await request.formData();
   const intent = String(form.get("intent") || "match");
 
-  // --- Status update (confirm / reject) -- patches the Match, no re-scrape.
+  // --- Status update (confirm / reject / reconsider) -- patches the Match, no
+  //     re-scrape. "reconsider" (un-reject) routes here too: it's just a
+  //     setStatus to needs_review, which pulls the row back into the tracked
+  //     list where the merchant can Re-check or Confirm it.
   if (intent === "setStatus") {
     const matchId = String(form.get("matchId") || "");
     const status = String(form.get("status") || "");
@@ -323,6 +346,7 @@ export default function Index() {
     currency,
     products,
     tracked,
+    rejected,
     alerts,
     unreadCount,
     cap,
@@ -599,6 +623,29 @@ export default function Index() {
               {Array.isArray(r.reasons) && r.reasons.length > 0 && (
                 <s-text>Why: {r.reasons.join("; ")}</s-text>
               )}
+              {/* Merchant-lock explanation. result.status is the PERSISTED
+                  status, but confidence/reasons above are the engine's fresh
+                  numbers -- so a locked row would otherwise contradict itself (a
+                  high % above "Not the same product", or a low % under
+                  "Confirmed match"). merchantLocked (set in recheck.server.ts)
+                  says the status is a sticky merchant decision; explain it and
+                  point at the reconsider affordance. */}
+              {r.merchantLocked && r.status === "rejected" && (
+                <s-text>
+                  You marked this as not a match, so it stays untracked even
+                  though the engine now scores it{" "}
+                  {Math.round((r.confidence ?? 0) * 100)}%. To undo that, use
+                  &quot;Reconsider&quot; under &quot;Not tracked - rejected&quot;
+                  below.
+                </s-text>
+              )}
+              {r.merchantLocked && r.status === "confirmed" && (
+                <s-text>
+                  You confirmed this match, so it stays tracked. The percentage
+                  above is the engine&apos;s current similarity score, not your
+                  decision.
+                </s-text>
+              )}
               {atLimit && (
                 <s-text>
                   Not tracked - you're at your plan's competitor limit (see above).
@@ -776,6 +823,47 @@ export default function Index() {
           </s-stack>
         )}
       </s-section>
+
+      {/* Rejected / not-tracked decisions. These are excluded from "Tracked"
+          above, so this is the only place they're visible and the only way to
+          reverse a rejection. "Reconsider" flips the row back to needs_review,
+          which returns it to the Tracked list where it can be Re-checked or
+          Confirmed. Rendered only when there's at least one, so it stays out of
+          the way on a clean store. */}
+      {rejected.length > 0 && (
+        <s-section heading={`Not tracked - rejected (${rejected.length})`}>
+          <s-paragraph>
+            Competitors you marked as &quot;not a match.&quot; They aren&apos;t
+            tracked and don&apos;t count toward your plan. Reconsider one to send
+            it back for review.
+          </s-paragraph>
+          <s-stack direction="block" gap="base">
+            {rejected.map((m) => (
+              <s-box key={m.id} padding="base" borderWidth="base" borderRadius="base" background="subdued">
+                <s-stack direction="block" gap="base">
+                  <s-heading>{m.productTitle}</s-heading>
+                  <s-text>Competitor: {m.competitorHost ?? m.competitorUrl}</s-text>
+                  <s-text>
+                    Marked not a match
+                    {m.confidence != null
+                      ? ` - the engine scored it ${Math.round((m.confidence ?? 0) * 100)}% before you rejected it`
+                      : ""}
+                    .
+                  </s-text>
+                  <s-stack direction="inline" gap="base">
+                    <s-button
+                      onClick={() => setStatus(m.id, "needs_review")}
+                      {...(busy ? { loading: true } : {})}
+                    >
+                      Reconsider - send back for review
+                    </s-button>
+                  </s-stack>
+                </s-stack>
+              </s-box>
+            ))}
+          </s-stack>
+        </s-section>
+      )}
 
       <s-section heading={`Your catalog (${products.length})`}>
         {products.length === 0 ? (
